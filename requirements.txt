@@ -1,0 +1,6 @@
+tensorflow
+numpy
+resampy
+python-configuration[yaml]
+google-cloud-storage
+pydub
