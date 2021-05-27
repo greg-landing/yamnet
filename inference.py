@@ -8,6 +8,7 @@ import tensorflow as tf
 import urllib.request
 import itertools
 import io
+import jsonlines
 from pydub import AudioSegment
 
 
@@ -35,7 +36,7 @@ def parse_arguments():
     parser = ArgumentParser("Run YAMNET on a set of audio files.")
 
     parser.add_argument("-i", "--input-path", default="gs://the-peoples-speech-west-europe/forced-aligner/cuda-forced-aligner/output_work_dir_5b/output_work_dir_5b/training_set", help="Path to yamnet dataset.")
-    parser.add_argument("-o", "--output-dataset-path", default="", help="The path to save the results.")
+    parser.add_argument("-o", "--output-path", default="results.jsonl", help="The path to save the results.")
     parser.add_argument("-c", "--config-file-path", default=".json", help="The path to the config file.")
     parser.add_argument("-v", "--verbose", default=False, action="store_true", help="Print out debug messages.")
     parser.add_argument("-vi", "--verbose-info", default=False, action="store_true", help="Print out info messages.")
@@ -50,28 +51,32 @@ def parse_arguments():
 def run_inference(config):
     model, classes, params = load_model(config)
 
-    dataset = get_dataset(config)
+    dataset, filenames = get_dataset(config)
 
-    run_model_on_dataset(model, classes, params, dataset, config)
+    run_model_on_dataset(model, classes, params, dataset, filenames, config)
 
 def get_dataset(config):
 
     logger.debug("Getting file paths")
-    ds = list_files(config["input_path"], config)
+    files, filenames = list_files(config["input_path"], config)
 
     logger.debug("Making dataset")
-    ds = ds.map(tf.io.read_file)
+    ds = files.map(tf.io.read_file)
     #ds = ds.map(tf.audio.decode_wav)
     ds = ds.map(lambda file : tf.py_function(func=decode_mp3, inp=[file], Tout=tf.float32))
     ds = ds.prefetch(buffer_size=tf.data.AUTOTUNE)
 
-    return ds
+    return ds, filenames
 
 def decode_mp3(mp3_tensor):
     mp3_data = mp3_tensor.numpy()
     mp3_file = io.BytesIO(mp3_data)
     mp3_audio = AudioSegment.from_file(mp3_file, format="mp3")
+    logger.debug("duration: " + str(mp3_audio.duration_seconds) + ", channels: " +
+        str(mp3_audio.channels) + ", sampling_width: " + str(mp3_audio.sample_width) +
+        ", sampling rate: " + str(mp3_audio.frame_rate) + ", dbfs: " + str(mp3_audio.dBFS) )
     mp3_audio = mp3_audio.set_channels(1)
+    mp3_audio = mp3_audio.set_sample_width(2)
     seconds = mp3_audio.duration_seconds
     max_duration = 600
     if seconds > max_duration:
@@ -83,7 +88,9 @@ def decode_mp3(mp3_tensor):
 
 def list_files(path, config):
     if not "max_files" in config:
-        return tf.data.Dataset.list_files(path, "*/*.wav")
+        filenames = tf.data.Dataset.list_files(path, "*/*.wav", shuffle=False)
+
+        return filenames, [filename.numpy().decode("utf-8") for filename in filenames]
 
     return list_blobs(path, int(config["max_files"]))
 
@@ -96,7 +103,10 @@ def list_blobs(path, max_files):
 
     logger.debug("Found matching files under " + path + ": " + str(files))
 
-    return tf.data.Dataset.list_files([os.path.join("gs://" + result.netloc, filename) for filename in files])
+
+    filenames = [os.path.join("gs://" + result.netloc, filename) for filename in files]
+
+    return tf.data.Dataset.list_files(filenames, shuffle=False), filenames
 
 def list_blobs_with_prefix(bucket_name, prefix, delimiter=None):
     """Lists all the blobs in the bucket that begin with the prefix.
@@ -179,14 +189,17 @@ def download(url, path):
         urllib.request.urlretrieve(url, path)
     logger.debug("Download success")
 
-def run_model_on_dataset(yamnet, classes, params, dataset, config):
+def run_model_on_dataset(yamnet, classes, params, dataset, filenames, config):
 
-    for batch in dataset:
-        items = split_into_items(batch, config)
-        logger.debug("chunks" + str(len(items)))
-        for index, item in enumerate(items):
-            results = run_model_on_batch(yamnet, classes, params, item)
-            print_results(results, classes, index, config)
+    with jsonlines.open(config["output_path"], mode='w') as writer:
+
+        for batch, filename in zip(dataset, filenames):
+            logger.debug(filename)
+            items = split_into_items(batch, config)
+            logger.debug("chunks" + str(len(items)))
+            for index, item in enumerate(items):
+                results = run_model_on_batch(yamnet, classes, params, item)
+                print_results(writer, filename, results, classes, index, config)
 
 def split_into_items(pair, config):
     batch = pair[:-1]
@@ -211,11 +224,19 @@ def split_into_items(pair, config):
 
     return items
 
-def print_results(results, yamnet_classes, index, config):
+def print_results(writer, filename, results, yamnet_classes, index, config):
     top, prediction = results
     seconds = index * float(config["seconds_per_chunk"])
     print(str(int(seconds // 60)) + ":" + str(int(seconds) % 60) + '\n'.join('  {:12s}: {:.3f}'.format(yamnet_classes[i], prediction[i])
                     for i in top[0:1]))
+
+    result = { "path" : filename, "seconds" : seconds }
+
+    for i in top:
+        result[yamnet_classes[i]] = float(prediction[i])
+
+    writer.write(result)
+
 def run_model_on_batch(yamnet, classes, params, pair):
 
     batch, sr = pair
