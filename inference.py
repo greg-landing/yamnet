@@ -71,7 +71,15 @@ def decode_mp3(mp3_tensor):
     mp3_data = mp3_tensor.numpy()
     mp3_file = io.BytesIO(mp3_data)
     mp3_audio = AudioSegment.from_file(mp3_file, format="mp3")
-    return mp3_audio.get_array_of_samples()
+    mp3_audio = mp3_audio.set_channels(1)
+    seconds = mp3_audio.duration_seconds
+    max_duration = 600
+    if seconds > max_duration:
+        mp3_audio = mp3_audio[0:max_duration*1000]
+    array = mp3_audio.get_array_of_samples()
+    array = np.append(array, [int(mp3_audio.frame_rate)])
+
+    return array
 
 def list_files(path, config):
     if not "max_files" in config:
@@ -125,11 +133,20 @@ def list_blobs_with_prefix(bucket_name, prefix, delimiter=None):
 
     for blob in blobs:
         logger.debug("Got file: " + str(blob.name))
-        yield blob.name
+        if is_audio(blob.name):
+            yield blob.name
 
     if delimiter:
         for prefix in blobs.prefixes:
             yield prefix
+
+def is_audio(path):
+    base, extension = os.path.splitext(path)
+
+    if extension.strip() == ".mp3":
+        return True
+
+    return False
 
 def load_model(config):
     logger.debug("Loading model...")
@@ -165,25 +182,51 @@ def download(url, path):
 def run_model_on_dataset(yamnet, classes, params, dataset, config):
 
     for batch in dataset:
-        results = run_model_on_batch(yamnet, classes, params, batch)
-        print_results(results, classes)
+        items = split_into_items(batch, config)
+        logger.debug("chunks" + str(len(items)))
+        for index, item in enumerate(items):
+            results = run_model_on_batch(yamnet, classes, params, item)
+            print_results(results, classes, index, config)
 
-def print_results(results, yamnet_classes):
+def split_into_items(pair, config):
+    batch = pair[:-1]
+    sr = int(pair[-1])
+    chunk_size = int(float(config["seconds_per_chunk"]) * sr)
+
+    array = batch.numpy()
+
+    sample_count = array.shape[-1]
+
+    logger.debug("total samples " + str(array.shape))
+
+    items = []
+
+    chunks = (sample_count + chunk_size - 1) // chunk_size
+
+    for chunk in range(chunks):
+        start = chunk * chunk_size
+        end   = min((chunk+1) * chunk_size, sample_count)
+
+        items.append((array[start:end], sr))
+
+    return items
+
+def print_results(results, yamnet_classes, index, config):
     top, prediction = results
-    print('\n'.join('  {:12s}: {:.3f}'.format(yamnet_classes[i], prediction[i])
-                    for i in top))
+    seconds = index * float(config["seconds_per_chunk"])
+    print(str(int(seconds // 60)) + ":" + str(int(seconds) % 60) + '\n'.join('  {:12s}: {:.3f}'.format(yamnet_classes[i], prediction[i])
+                    for i in top[0:1]))
+def run_model_on_batch(yamnet, classes, params, pair):
 
-def run_model_on_batch(yamnet, classes, params, batch):
+    batch, sr = pair
 
-    waveform = batch.numpy() / 32768.0  # Convert to [-1.0, +1.0]
-
-    sr = 48000
+    waveform = batch / 32768.0  # Convert to [-1.0, +1.0]
 
     # Convert to mono and the sample rate expected by YAMNet.
     if len(waveform.shape) > 1:
-      waveform = np.mean(waveform, axis=1)
+        waveform = np.mean(waveform, axis=1)
     if sr != params.sample_rate:
-      waveform = resampy.resample(waveform, sr, params.sample_rate)
+        waveform = resampy.resample(waveform, sr, params.sample_rate)
 
     # Predict YAMNet classes.
     scores, embeddings, spectrogram = yamnet(waveform)
@@ -229,6 +272,11 @@ def setup_logging(arguments):
         root_logger.setLevel(logging.INFO)
     else:
         root_logger.setLevel(logging.WARNING)
+
+    logging.getLogger("numba.core.ssa").setLevel(logging.CRITICAL)
+    logging.getLogger("numba.core.byteflow").setLevel(logging.CRITICAL)
+    logging.getLogger("numba.core.interpreter").setLevel(logging.CRITICAL)
+
 
 if __name__ == '__main__':
     main()
